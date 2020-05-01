@@ -27,6 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 FIREFLY_URL, FIREFLY_TOKEN, DEFAULT_WITHDRAW_ACCOUNT = range(3)
+SPEND, = range(1)
 
 
 def start(update, context):
@@ -40,21 +41,27 @@ def get_firefly_token(update, context):
     return DEFAULT_WITHDRAW_ACCOUNT
 
 
-def get_default_account(update, context):
-    token = update.message.text
-    firefly = Firefly(hostname=context.user_data.get("firefly_url"), auth_token=token)
+def get_reply_markup_select_account(context):
+    firefly = get_firefly(context)
     accounts = firefly.get_accounts(account_type="asset").get("data")
-
-    accounts_keyboard = []
+    accounts_keyboard = [[]]
     for account in accounts:
         account_name = account.get("attributes").get("name")
-        accounts_keyboard.append(
-            [InlineKeyboardButton(account_name, callback_data=account.get("id"))]
-        )
-
+        if len(accounts_keyboard[-1]) < 3:
+            accounts_keyboard[-1].append(
+                InlineKeyboardButton(account_name, callback_data=account.get("id"))
+            )
+        else:
+            accounts_keyboard.append(
+                [InlineKeyboardButton(account_name, callback_data=account.get("id"))]
+            )
     reply_markup = InlineKeyboardMarkup(accounts_keyboard)
+    return reply_markup
 
+
+def get_default_account(update, context):
     context.user_data["firefly_token"] = update.message.text
+    reply_markup = get_reply_markup_select_account(context)
     update.message.reply_text("Please choose:", reply_markup=reply_markup)
     return DEFAULT_WITHDRAW_ACCOUNT
 
@@ -67,7 +74,7 @@ def store_default_account(update, context):
     return ConversationHandler.END
 
 
-def spend(update, context):
+def get_spending_account(update, context):
     message = update.message.text.split(" ")
 
     if len(message) < 2:
@@ -76,22 +83,58 @@ def spend(update, context):
         )
         return
 
-    amount = message[0]
-    description = message[1]
-    category = message[2] if 2 < len(message) else None  # Safely try to check for index
-    budget = message[3] if 3 < len(message) else None  # Safely try to check for index
+    context.user_data["transaction_amount"] = message[0]
+    context.user_data["transaction_description"] = message[1]
+    context.user_data["transaction_category"] = message[2] if 2 < len(message) else None
+    reply_markup = get_reply_markup_select_account(context)
+    update.message.reply_text("Choose account:", reply_markup=reply_markup)
+    return SPEND
+
+
+def get_budget(update, context):
+    query = update.callback_query
+    context.user_data["transaction_account"] = query.data
 
     firefly = get_firefly(context)
-    account = context.user_data["firefly_default_account"]
+    budgets = firefly.get_budgets()["data"]
+    budgets_keyboard = [[]]
+    for budget in budgets:
+        budget_name = budget.get("attributes").get("name")
+        if len(budgets_keyboard[-1]) < 3:
+            budgets_keyboard[-1].append(
+                InlineKeyboardButton(budget_name, callback_data=budget_name)
+            )
+        else:
+            budgets_keyboard.append(
+                [InlineKeyboardButton(budget_name, callback_data=budget_name)]
+            )
+    budgets_keyboard.append([InlineKeyboardButton("none", callback_data=0)])
+    reply_markup = InlineKeyboardMarkup(budgets_keyboard)
+    query.edit_message_text("Select budget", reply_markup=reply_markup)
+    return SPEND
+
+
+def spend(update, context):
+    query = update.callback_query
+    if query.data == 0:
+        query.data = None
+    context.user_data["transaction_budget"] = query.data
+
+    firefly = get_firefly(context)
     response = firefly.create_transaction(
-        amount, description, account, category, budget
+        context.user_data["transaction_amount"],
+        context.user_data["transaction_description"],
+        context.user_data["transaction_account"],
+        context.user_data["transaction_category"],
+        context.user_data["transaction_budget"],
     )
     if response.status_code == 422:
-        update.message.reply_text(response.get("message"))
+        query.edit_message_text(response.get("message"))
     elif response.status_code == 200:
-        update.message.reply_text("Transaction made successfully")
+        query.edit_message_text("Transaction made successfully")
     else:
-        update.message.reply_text("Something went wrong, check logs")
+        query.edit_message_text("Something went wrong, check logs")
+    return ConversationHandler.END
 
 
 def about(update, context):
@@ -112,7 +155,7 @@ def help(update, context):
         update.message.reply_text("Type /start to initiate the setup process.")
     else:
         update.message.reply_text(
-            """Just type in an expense with a description. \Like this - 
+            """Just type in an expense with a description. \Like this -
         \n '5 Starbucks' \n Additionally you can also include the category and budget (both optional)
         \n '5 Starbucks Coffee Food'"""
         )
@@ -137,7 +180,7 @@ def main():
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     updater = Updater(bot_token, persistence=bot_persistence, use_context=True)
 
-    conversation_handler = ConversationHandler(
+    conversation_handler_setup = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             FIREFLY_URL: [MessageHandler(Filters.text, get_firefly_token)],
@@ -149,13 +192,23 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    conversation_handler_spend = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex("^[0-9]+"), get_spending_account)],
+        states={
+            SPEND: [
+                CallbackQueryHandler(get_budget, pattern="^[0-9]*$"),
+                CallbackQueryHandler(spend, pattern="^.*$"),
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     updater.dispatcher.add_handler(CommandHandler("help", help))
     updater.dispatcher.add_handler(CommandHandler("about", about))
-    updater.dispatcher.add_handler(
-        MessageHandler(filters=Filters.regex("^[0-9]+"), callback=spend)
-    )
     updater.dispatcher.add_error_handler(error)
-    updater.dispatcher.add_handler(conversation_handler)
+    updater.dispatcher.add_handler(conversation_handler_setup)
+    updater.dispatcher.add_handler(conversation_handler_spend)
+    # updater.dispatcher.add_handler([MessageHandler(filters=Filters.regex("^[0-9]+"), callback=get_spending_account), CallbackQueryHandler(store_default_account, pattern="^[0-9]*$")])
 
     # Start the Bot
     updater.start_polling()
